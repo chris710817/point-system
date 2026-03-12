@@ -150,7 +150,7 @@ class StaffFrame(tk.Frame):
         # ---------------- Staff Accounts ----------------
         tk.Label(mid_col, text="Staff Accounts", font=("Arial", 14, "bold")).pack(pady=(2, 5))
 
-        self.staff_listbox = tk.Listbox(mid_col, width=55, height=6)
+        self.staff_listbox = tk.Listbox(mid_col, width=30, height=6)
         self.staff_listbox.pack(pady=5)
 
         tk.Label(mid_col, text="Username", font=("Arial", 10, "bold")).pack()
@@ -285,7 +285,7 @@ class StaffFrame(tk.Frame):
         for row in self.history_tree.get_children():
             self.history_tree.delete(row)
 
-        for i, (_, name, flight, points, category, reason, timestamp, is_custom, staff) in enumerate(get_point_history()):
+        for i, (_, name, flight, points, category, reason, timestamp, is_custom, staff) in enumerate(get_point_history(200)):
             date_part = timestamp[:10]
             time_part = timestamp[11:19]
             points_str = f"{points:+}"
@@ -294,6 +294,10 @@ class StaffFrame(tk.Frame):
             self.history_tree.insert("", tk.END, values=(
                 date_part, time_part, staff, name, flight, points_str, category, reason
             ), tags=(tag,))
+
+        # Snap to the top so the most recent entry (newest-first order) is always visible
+        self.history_tree.yview_moveto(0)
+        self.update_idletasks()  # Force the scrollbar thumb to redraw immediately
 
     # ---------------- Staff Accounts ----------------
     def refresh_staff_list(self):
@@ -528,11 +532,17 @@ class StaffFrame(tk.Frame):
         sub = self.new_sub_entry.get().strip()
         pts = self.new_points_entry.get().strip()
 
-        if not cat or not sub or not pts.isdigit():
-            messagebox.showerror("Error", "Please enter valid category, award and points")
+        if not cat or not sub:
+            messagebox.showerror("Error", "Please enter a category and award name")
             return
 
-        add_point_category(cat, sub, int(pts))
+        try:
+            pts_int = int(pts)
+        except ValueError:
+            messagebox.showerror("Error", "Points must be a whole number (can be negative)")
+            return
+
+        add_point_category(cat, sub, pts_int)
         messagebox.showinfo("Success", f"{cat} - {sub} added")
 
         self.new_cat_entry.delete(0, tk.END)

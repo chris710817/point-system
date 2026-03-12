@@ -635,3 +635,55 @@ def get_award_holders(point_category_id):
     rows = cursor.fetchall()
     conn.close()
     return rows
+
+
+def get_most_popular_events(limit=15):
+    """
+    Returns the most frequently awarded events ordered by how many
+    cadets have received them. Queries across the cadet_awards junction
+    table joined to point_categories — demonstrates many-to-many traversal.
+    Returns: [(category, subcategory, award_count)]
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT
+            point_categories.category,
+            point_categories.subcategory,
+            COUNT(cadet_awards.cadet_id) AS award_count
+        FROM cadet_awards
+        JOIN point_categories ON cadet_awards.point_category_id = point_categories.id
+        GROUP BY point_categories.id
+        ORDER BY award_count DESC
+        LIMIT ?
+    """, (limit,))
+    rows = cursor.fetchall()
+    conn.close()
+    return rows
+
+
+def get_cadets_for_event(category, subcategory):
+    """
+    Returns all cadets who earned a specific event/award.
+    Traverses: point_categories -> cadet_awards -> cadets -> flights
+    Returns: [(cadet_name, flight_name, date_awarded, awarded_by)]
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT
+            cadets.name,
+            flights.name,
+            cadet_awards.date_awarded,
+            cadet_awards.awarded_by
+        FROM cadet_awards
+        JOIN point_categories ON cadet_awards.point_category_id = point_categories.id
+        JOIN cadets            ON cadet_awards.cadet_id          = cadets.id
+        JOIN flights           ON cadets.flight_id               = flights.id
+        WHERE point_categories.category    = ?
+          AND point_categories.subcategory = ?
+        ORDER BY cadet_awards.date_awarded DESC
+    """, (category, subcategory))
+    rows = cursor.fetchall()
+    conn.close()
+    return rows
