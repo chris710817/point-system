@@ -19,12 +19,15 @@ def get_connection():
 # Creates all tables with primary keys, foreign keys, and constraints.
 #
 # Relationships implemented:
-#   ONE-TO-ONE  : users  ──── staff_profiles
-#   ONE-TO-MANY : flights ──< cadets
-#   ONE-TO-MANY : cadets  ──< point_history
-#   ONE-TO-MANY : users   ──< point_history
+#   ONE-TO-ONE  : users        ──── staff_profiles
+#   ONE-TO-MANY : flights      ──< cadets
+#   ONE-TO-MANY : cadets       ──< point_history
+#   ONE-TO-MANY : users        ──< point_history
 #   ONE-TO-MANY : point_categories ──< point_history
-#   MANY-TO-MANY: cadets >──< point_categories  (via cadet_awards junction table)
+#
+#   MANY-TO-MANY: cadets >──< point_categories
+#     Implemented directly through point_history (no separate junction table).
+#     A cadet can earn many categories; a category can be earned by many cadets.
 # ==============================================================================
 
 def initialise_database():
@@ -87,7 +90,7 @@ def initialise_database():
     # ── point_categories ───────────────────────────────────────────────────────
     # Each row is a specific award within a category (e.g. Shooting > Gold).
     # ONE-TO-MANY: one category row can appear in many point_history entries.
-    # MANY-TO-MANY: linked to cadets via cadet_awards junction table.
+    # MANY-TO-MANY: a category can be earned by many cadets via point_history.
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS point_categories (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -99,8 +102,9 @@ def initialise_database():
     """)
 
     # ── point_history ──────────────────────────────────────────────────────────
-    # Audit log of every point award event.
-    # Foreign keys link to: cadets, users, point_categories.
+    # Single source of truth for all point data. Links cadets, users, and
+    # point_categories via foreign keys, implementing the many-to-many
+    # relationship between cadets and awards directly without a junction table.
     # is_custom = 1 means staff entered a manual value (point_category_id is NULL).
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS point_history (
@@ -113,22 +117,6 @@ def initialise_database():
             is_custom          INTEGER NOT NULL DEFAULT 0,
             staff_username     TEXT    REFERENCES users(username),
             point_category_id  INTEGER REFERENCES point_categories(id)
-        )
-    """)
-
-    # ── cadet_awards ───────────────────────────────────────────────────────────
-    # Junction / link table implementing the MANY-TO-MANY relationship between
-    # cadets and point_categories.
-    # A cadet can earn many different awards; the same award can go to many cadets.
-    # date_awarded lets us track when each specific award was first achieved.
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS cadet_awards (
-            id                 INTEGER PRIMARY KEY AUTOINCREMENT,
-            cadet_id           INTEGER NOT NULL REFERENCES cadets(id)           ON DELETE CASCADE,
-            point_category_id  INTEGER NOT NULL REFERENCES point_categories(id) ON DELETE CASCADE,
-            date_awarded       TEXT    NOT NULL,
-            awarded_by         TEXT    REFERENCES users(username),
-            UNIQUE(cadet_id, point_category_id)
         )
     """)
 
@@ -168,6 +156,21 @@ def initialise_database():
 
     if "point_category_id" not in history_cols:
         cursor.execute("ALTER TABLE point_history ADD COLUMN point_category_id INTEGER REFERENCES point_categories(id)")
+
+    # Repair any old point_history rows that have category/reason as text
+    # but are missing the point_category_id FK — match by text to fix them up.
+    cursor.execute("""
+        UPDATE point_history
+        SET point_category_id = (
+            SELECT point_categories.id FROM point_categories
+            WHERE point_categories.category    = point_history.category
+              AND point_categories.subcategory = point_history.reason
+        )
+        WHERE point_category_id IS NULL
+          AND is_custom = 0
+          AND category IS NOT NULL
+          AND reason IS NOT NULL
+    """)
 
     conn.commit()
     conn.close()
@@ -339,9 +342,8 @@ def get_all_cadets():
 def delete_cadet(cadet_id):
     conn = get_connection()
     cursor = conn.cursor()
-    # Delete history and awards first (cadet_awards has CASCADE but point_history does not)
+    # Delete all point history for this cadet first
     cursor.execute("DELETE FROM point_history WHERE cadet_id = ?", (cadet_id,))
-    cursor.execute("DELETE FROM cadet_awards  WHERE cadet_id = ?", (cadet_id,))
     cursor.execute("DELETE FROM cadets        WHERE id = ?",       (cadet_id,))
     conn.commit()
     conn.close()
@@ -414,20 +416,6 @@ def add_points(cadet_id, points, category, reason, is_custom,
         int(is_custom), staff_username, point_category_id
     ))
 
-    # If this is a standard award (not custom), record it in cadet_awards too.
-    # UNIQUE constraint means each cadet/award pair is only stored once — this
-    # shows the many-to-many relationship between cadets and point_categories.
-    if point_category_id and not is_custom:
-        cursor.execute("""
-            INSERT OR IGNORE INTO cadet_awards
-                (cadet_id, point_category_id, date_awarded, awarded_by)
-            VALUES (?, ?, ?, ?)
-        """, (
-            cadet_id, point_category_id,
-            datetime.datetime.now().isoformat()[:10],
-            staff_username
-        ))
-
     conn.commit()
     conn.close()
 
@@ -456,19 +444,6 @@ def undo_last_action():
         "DELETE FROM point_history WHERE id = ?",
         (history_id,)
     )
-
-    # Also remove from cadet_awards if this was the only award of that type
-    if point_category_id:
-        cursor.execute("""
-            SELECT COUNT(*) FROM point_history
-            WHERE cadet_id = ? AND point_category_id = ?
-        """, (cadet_id, point_category_id))
-        remaining = cursor.fetchone()[0]
-        if remaining == 0:
-            cursor.execute("""
-                DELETE FROM cadet_awards
-                WHERE cadet_id = ? AND point_category_id = ?
-            """, (cadet_id, point_category_id))
 
     conn.commit()
     conn.close()
@@ -591,21 +566,24 @@ def add_point_category(category, subcategory, points):
 
 def get_cadet_awards(cadet_id):
     """
-    Returns all awards a specific cadet has achieved.
-    Demonstrates a cross-table JOIN across the many-to-many junction table.
+    Returns all distinct awards a specific cadet has achieved, queried
+    directly from point_history. Each award type appears once (DISTINCT).
+    Demonstrates many-to-many traversal: cadets <-> point_categories via point_history.
     """
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute("""
-        SELECT
+        SELECT DISTINCT
             point_categories.category,
             point_categories.subcategory,
             point_categories.points,
-            cadet_awards.date_awarded,
-            cadet_awards.awarded_by
-        FROM cadet_awards
-        JOIN point_categories ON cadet_awards.point_category_id = point_categories.id
-        WHERE cadet_awards.cadet_id = ?
+            MIN(point_history.timestamp) AS first_awarded,
+            point_history.staff_username
+        FROM point_history
+        JOIN point_categories ON point_history.point_category_id = point_categories.id
+        WHERE point_history.cadet_id = ?
+          AND point_history.is_custom = 0
+        GROUP BY point_categories.id
         ORDER BY point_categories.category, point_categories.subcategory
     """, (cadet_id,))
     rows = cursor.fetchall()
@@ -613,35 +591,11 @@ def get_cadet_awards(cadet_id):
     return rows
 
 
-def get_award_holders(point_category_id):
-    """
-    Returns all cadets who have achieved a specific award.
-    The reverse traversal of the many-to-many relationship.
-    """
-    conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute("""
-        SELECT
-            cadets.name,
-            flights.name,
-            cadet_awards.date_awarded,
-            cadet_awards.awarded_by
-        FROM cadet_awards
-        JOIN cadets  ON cadet_awards.cadet_id  = cadets.id
-        JOIN flights ON cadets.flight_id       = flights.id
-        WHERE cadet_awards.point_category_id = ?
-        ORDER BY cadet_awards.date_awarded DESC
-    """, (point_category_id,))
-    rows = cursor.fetchall()
-    conn.close()
-    return rows
-
-
 def get_most_popular_events(limit=15):
     """
-    Returns the most frequently awarded events ordered by how many
-    cadets have received them. Queries across the cadet_awards junction
-    table joined to point_categories — demonstrates many-to-many traversal.
+    Returns the most frequently awarded events ordered by how many times
+    they appear in point_history. Queries directly from point_history joined
+    to point_categories — single source of truth, no junction table needed.
     Returns: [(category, subcategory, award_count)]
     """
     conn = get_connection()
@@ -650,9 +604,10 @@ def get_most_popular_events(limit=15):
         SELECT
             point_categories.category,
             point_categories.subcategory,
-            COUNT(cadet_awards.cadet_id) AS award_count
-        FROM cadet_awards
-        JOIN point_categories ON cadet_awards.point_category_id = point_categories.id
+            COUNT(point_history.id) AS award_count
+        FROM point_history
+        JOIN point_categories ON point_history.point_category_id = point_categories.id
+        WHERE point_history.is_custom = 0
         GROUP BY point_categories.id
         ORDER BY award_count DESC
         LIMIT ?
@@ -664,9 +619,9 @@ def get_most_popular_events(limit=15):
 
 def get_cadets_for_event(category, subcategory):
     """
-    Returns all cadets who earned a specific event/award.
-    Traverses: point_categories -> cadet_awards -> cadets -> flights
-    Returns: [(cadet_name, flight_name, date_awarded, awarded_by)]
+    Returns all cadets who earned a specific event/award, read directly
+    from point_history. Traverses: point_categories -> point_history -> cadets -> flights.
+    Returns: [(cadet_name, flight_name, timestamp, awarded_by)]
     """
     conn = get_connection()
     cursor = conn.cursor()
@@ -674,15 +629,16 @@ def get_cadets_for_event(category, subcategory):
         SELECT
             cadets.name,
             flights.name,
-            cadet_awards.date_awarded,
-            cadet_awards.awarded_by
-        FROM cadet_awards
-        JOIN point_categories ON cadet_awards.point_category_id = point_categories.id
-        JOIN cadets            ON cadet_awards.cadet_id          = cadets.id
-        JOIN flights           ON cadets.flight_id               = flights.id
+            point_history.timestamp,
+            point_history.staff_username
+        FROM point_history
+        JOIN point_categories ON point_history.point_category_id = point_categories.id
+        JOIN cadets            ON point_history.cadet_id          = cadets.id
+        JOIN flights           ON cadets.flight_id                = flights.id
         WHERE point_categories.category    = ?
           AND point_categories.subcategory = ?
-        ORDER BY cadet_awards.date_awarded DESC
+          AND point_history.is_custom = 0
+        ORDER BY point_history.timestamp DESC
     """, (category, subcategory))
     rows = cursor.fetchall()
     conn.close()
