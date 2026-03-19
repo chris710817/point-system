@@ -150,7 +150,7 @@ class StaffFrame(tk.Frame):
         # ---------------- Staff Accounts ----------------
         tk.Label(mid_col, text="Staff Accounts", font=("Arial", 14, "bold")).pack(pady=(2, 5))
 
-        self.staff_listbox = tk.Listbox(mid_col, width=30, height=6)
+        self.staff_listbox = tk.Listbox(mid_col, width=55, height=6)
         self.staff_listbox.pack(pady=5)
 
         tk.Label(mid_col, text="Username", font=("Arial", 10, "bold")).pack()
