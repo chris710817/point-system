@@ -286,17 +286,42 @@ def get_all_flights():
     return rows
 
 
-def get_flight_totals():
-    """Returns total points per flight by JOINing cadets to flights."""
+def get_available_years():
+    """Returns a list of distinct years (as strings) that appear in point_history, newest first."""
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute("""
-        SELECT flights.name, COALESCE(SUM(cadets.points), 0)
-        FROM flights
-        LEFT JOIN cadets ON cadets.flight_id = flights.id
-        GROUP BY flights.id
-        ORDER BY SUM(cadets.points) DESC
+        SELECT DISTINCT strftime('%Y', timestamp) AS year
+        FROM point_history
+        ORDER BY year DESC
     """)
+    rows = cursor.fetchall()
+    conn.close()
+    return [row[0] for row in rows]
+
+
+def get_flight_totals(year=None):
+    """Returns total points per flight. If year is given, only counts points from that year."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    if year is None:
+        cursor.execute("""
+            SELECT flights.name, COALESCE(SUM(cadets.points), 0)
+            FROM flights
+            LEFT JOIN cadets ON cadets.flight_id = flights.id
+            GROUP BY flights.id
+            ORDER BY SUM(cadets.points) DESC
+        """)
+    else:
+        cursor.execute("""
+            SELECT flights.name, COALESCE(SUM(point_history.points), 0)
+            FROM flights
+            LEFT JOIN cadets       ON cadets.flight_id       = flights.id
+            LEFT JOIN point_history ON point_history.cadet_id = cadets.id
+                AND strftime('%Y', point_history.timestamp) = ?
+            GROUP BY flights.id
+            ORDER BY COALESCE(SUM(point_history.points), 0) DESC
+        """, (year,))
     results = cursor.fetchall()
     conn.close()
     return results
@@ -315,11 +340,9 @@ def add_cadet(name, flight_name):
         conn.close()
         raise ValueError(f"Flight '{flight_name}' not found")
 
-    # Write both flight_id (new FK) and flight (legacy text column) so existing
-    # databases with a NOT NULL constraint on flight are still satisfied.
     cursor.execute("""
-        INSERT INTO cadets (name, flight, flight_id) VALUES (?, ?, ?)
-    """, (name, flight_name, flight_row[0]))
+        INSERT INTO cadets (name, flight_id) VALUES (?, ?)
+    """, (name, flight_row[0]))
     conn.commit()
     conn.close()
 
@@ -357,33 +380,60 @@ def update_cadet_flight(cadet_id, new_flight_name):
     if not flight_row:
         conn.close()
         raise ValueError(f"Flight '{new_flight_name}' not found")
-    # Update both columns to keep legacy and new schema in sync
     cursor.execute(
-        "UPDATE cadets SET flight = ?, flight_id = ? WHERE id = ?",
-        (new_flight_name, flight_row[0], cadet_id)
+        "UPDATE cadets SET flight_id = ? WHERE id = ?",
+        (flight_row[0], cadet_id)
     )
     conn.commit()
     conn.close()
 
 
-def get_leaderboard(flight_name=None):
+def get_leaderboard(flight_name=None, year=None):
+    """Returns leaderboard rows. If year is given, totals are computed from point_history for that year."""
     conn = get_connection()
     cursor = conn.cursor()
-    if flight_name is None or flight_name == "All Flights":
-        cursor.execute("""
-            SELECT cadets.name, flights.name, cadets.points
-            FROM cadets
-            JOIN flights ON cadets.flight_id = flights.id
-            ORDER BY cadets.points DESC
-        """)
+    flight_filter = flight_name not in (None, "All Flights")
+
+    if year is None:
+        if not flight_filter:
+            cursor.execute("""
+                SELECT cadets.name, flights.name, cadets.points
+                FROM cadets
+                JOIN flights ON cadets.flight_id = flights.id
+                ORDER BY cadets.points DESC
+            """)
+        else:
+            cursor.execute("""
+                SELECT cadets.name, flights.name, cadets.points
+                FROM cadets
+                JOIN flights ON cadets.flight_id = flights.id
+                WHERE flights.name = ?
+                ORDER BY cadets.points DESC
+            """, (flight_name,))
     else:
-        cursor.execute("""
-            SELECT cadets.name, flights.name, cadets.points
-            FROM cadets
-            JOIN flights ON cadets.flight_id = flights.id
-            WHERE flights.name = ?
-            ORDER BY cadets.points DESC
-        """, (flight_name,))
+        if not flight_filter:
+            cursor.execute("""
+                SELECT cadets.name, flights.name,
+                       COALESCE(SUM(point_history.points), 0) AS pts
+                FROM cadets
+                JOIN flights ON cadets.flight_id = flights.id
+                LEFT JOIN point_history ON point_history.cadet_id = cadets.id
+                    AND strftime('%Y', point_history.timestamp) = ?
+                GROUP BY cadets.id
+                ORDER BY pts DESC
+            """, (year,))
+        else:
+            cursor.execute("""
+                SELECT cadets.name, flights.name,
+                       COALESCE(SUM(point_history.points), 0) AS pts
+                FROM cadets
+                JOIN flights ON cadets.flight_id = flights.id
+                LEFT JOIN point_history ON point_history.cadet_id = cadets.id
+                    AND strftime('%Y', point_history.timestamp) = ?
+                WHERE flights.name = ?
+                GROUP BY cadets.id
+                ORDER BY pts DESC
+            """, (year, flight_name))
     rows = cursor.fetchall()
     conn.close()
     return rows
@@ -591,55 +641,87 @@ def get_cadet_awards(cadet_id):
     return rows
 
 
-def get_most_popular_events(limit=15):
+def get_most_popular_events(limit=15, year=None):
     """
     Returns the most frequently awarded events ordered by how many times
-    they appear in point_history. Queries directly from point_history joined
-    to point_categories — single source of truth, no junction table needed.
+    they appear in point_history. If year is given, only counts entries from that year.
     Returns: [(category, subcategory, award_count)]
     """
     conn = get_connection()
     cursor = conn.cursor()
-    cursor.execute("""
-        SELECT
-            point_categories.category,
-            point_categories.subcategory,
-            COUNT(point_history.id) AS award_count
-        FROM point_history
-        JOIN point_categories ON point_history.point_category_id = point_categories.id
-        WHERE point_history.is_custom = 0
-        GROUP BY point_categories.id
-        ORDER BY award_count DESC
-        LIMIT ?
-    """, (limit,))
+    if year is None:
+        cursor.execute("""
+            SELECT
+                point_categories.category,
+                point_categories.subcategory,
+                COUNT(point_history.id) AS award_count
+            FROM point_history
+            JOIN point_categories ON point_history.point_category_id = point_categories.id
+            WHERE point_history.is_custom = 0
+            GROUP BY point_categories.id
+            ORDER BY award_count DESC
+            LIMIT ?
+        """, (limit,))
+    else:
+        cursor.execute("""
+            SELECT
+                point_categories.category,
+                point_categories.subcategory,
+                COUNT(point_history.id) AS award_count
+            FROM point_history
+            JOIN point_categories ON point_history.point_category_id = point_categories.id
+            WHERE point_history.is_custom = 0
+              AND strftime('%Y', point_history.timestamp) = ?
+            GROUP BY point_categories.id
+            ORDER BY award_count DESC
+            LIMIT ?
+        """, (year, limit))
     rows = cursor.fetchall()
     conn.close()
     return rows
 
 
-def get_cadets_for_event(category, subcategory):
+def get_cadets_for_event(category, subcategory, year=None):
     """
-    Returns all cadets who earned a specific event/award, read directly
-    from point_history. Traverses: point_categories -> point_history -> cadets -> flights.
+    Returns all cadets who earned a specific event/award.
+    If year is given, only returns entries from that year.
     Returns: [(cadet_name, flight_name, timestamp, awarded_by)]
     """
     conn = get_connection()
     cursor = conn.cursor()
-    cursor.execute("""
-        SELECT
-            cadets.name,
-            flights.name,
-            point_history.timestamp,
-            point_history.staff_username
-        FROM point_history
-        JOIN point_categories ON point_history.point_category_id = point_categories.id
-        JOIN cadets            ON point_history.cadet_id          = cadets.id
-        JOIN flights           ON cadets.flight_id                = flights.id
-        WHERE point_categories.category    = ?
-          AND point_categories.subcategory = ?
-          AND point_history.is_custom = 0
-        ORDER BY point_history.timestamp DESC
-    """, (category, subcategory))
+    if year is None:
+        cursor.execute("""
+            SELECT
+                cadets.name,
+                flights.name,
+                point_history.timestamp,
+                point_history.staff_username
+            FROM point_history
+            JOIN point_categories ON point_history.point_category_id = point_categories.id
+            JOIN cadets            ON point_history.cadet_id          = cadets.id
+            JOIN flights           ON cadets.flight_id                = flights.id
+            WHERE point_categories.category    = ?
+              AND point_categories.subcategory = ?
+              AND point_history.is_custom = 0
+            ORDER BY point_history.timestamp DESC
+        """, (category, subcategory))
+    else:
+        cursor.execute("""
+            SELECT
+                cadets.name,
+                flights.name,
+                point_history.timestamp,
+                point_history.staff_username
+            FROM point_history
+            JOIN point_categories ON point_history.point_category_id = point_categories.id
+            JOIN cadets            ON point_history.cadet_id          = cadets.id
+            JOIN flights           ON cadets.flight_id                = flights.id
+            WHERE point_categories.category    = ?
+              AND point_categories.subcategory = ?
+              AND point_history.is_custom = 0
+              AND strftime('%Y', point_history.timestamp) = ?
+            ORDER BY point_history.timestamp DESC
+        """, (category, subcategory, year))
     rows = cursor.fetchall()
     conn.close()
     return rows

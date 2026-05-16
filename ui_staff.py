@@ -550,5 +550,12 @@ class StaffFrame(tk.Frame):
         self.new_points_entry.delete(0, tk.END)
 
         self.categories = get_point_categories()
+        add_points_menu = self.category_menu["menu"]
+        add_points_menu.delete(0, "end")
+        for c in self.categories.keys():
+            add_points_menu.add_command(
+                label=c,
+                command=lambda c=c: (self.category_var.set(c), self.update_subcategories(c))
+            )
         self.load_edit_categories()
         self.update_subcategories(self.category_var.get())
