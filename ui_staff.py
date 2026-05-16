@@ -112,10 +112,21 @@ class StaffFrame(tk.Frame):
         # ---------------- Add Points ----------------
         tk.Label(mid_col, text="Add Points", font=("Arial", 14, "bold")).pack(pady=(10, 5))
 
-        self.cadet_var = tk.IntVar()
+        self._selected_cadet_id = 0
+        self._cadet_labels = []
+        self._cadet_id_map = {}
+        self._dropdown_win = None
+        self._dropdown_list = None
+        self.cadet_search_var = tk.StringVar()
         tk.Label(mid_col, text="Select Cadet", font=("Arial", 10, "bold")).pack()
-        self.cadet_menu = tk.OptionMenu(mid_col, self.cadet_var, "")
-        self.cadet_menu.pack()
+        self.cadet_entry = ttk.Entry(mid_col, textvariable=self.cadet_search_var, width=30)
+        self.cadet_entry.pack()
+        self.cadet_entry.bind("<FocusIn>",    lambda e: self.cadet_entry.select_range(0, tk.END))
+        self.cadet_entry.bind("<KeyRelease>", self._filter_cadets)
+        self.cadet_entry.bind("<Down>",       lambda e: self._focus_dropdown_list())
+        self.cadet_entry.bind("<Return>",     lambda e: self._select_first())
+        self.cadet_entry.bind("<Escape>",     lambda e: self._hide_dropdown())
+        self.cadet_entry.bind("<FocusOut>",   self._on_entry_focus_out)
 
         tk.Label(mid_col, text="Category", font=("Arial", 10, "bold")).pack(pady=(8, 0))
         self.category_var = tk.StringVar()
@@ -263,16 +274,9 @@ class StaffFrame(tk.Frame):
 
     # ---------------- Refresh ----------------
     def refresh(self):
-        menu = self.cadet_menu["menu"]
-        menu.delete(0, "end")
-
         self.cadets = get_all_cadets()
-
-        for cadet_id, name, flight, points in self.cadets:
-            menu.add_command(
-                label=f"{name} ({flight})",
-                command=lambda c=cadet_id: self.set_cadet(c)
-            )
+        self._cadet_labels = [f"{name} ({flight})" for _, name, flight, _ in self.cadets]
+        self._cadet_id_map = {f"{name} ({flight})": cid for cid, name, flight, _ in self.cadets}
 
         if self.cadets:
             self.set_cadet(self.cadets[0][0])
@@ -353,7 +357,7 @@ class StaffFrame(tk.Frame):
 
     # ---------------- Add Points ----------------
     def add_points(self):
-        cadet_id = self.cadet_var.get()
+        cadet_id = self._selected_cadet_id
         if not cadet_id:
             messagebox.showerror("Error", "No cadet selected")
             return
@@ -482,11 +486,106 @@ class StaffFrame(tk.Frame):
         self.load_edit_categories()
         self.update_subcategories(self.category_var.get())
 
+    # ---------------- Cadet search ----------------
+    def _filter_cadets(self, event=None):
+        if event and event.keysym in ('Down', 'Up', 'Return', 'Escape', 'Tab', 'Left', 'Right'):
+            return
+        typed = self.cadet_search_var.get()
+        filtered = [l for l in self._cadet_labels if typed.lower() in l.lower()] if typed else self._cadet_labels
+        if filtered:
+            self._show_dropdown(filtered)
+        else:
+            self._hide_dropdown()
+
+    def _show_dropdown(self, items):
+        self._hide_dropdown()
+
+        # Capture entry position before creating the new window
+        self.cadet_entry.update_idletasks()
+        x = self.cadet_entry.winfo_rootx()
+        y = self.cadet_entry.winfo_rooty() + self.cadet_entry.winfo_height()
+        w = self.cadet_entry.winfo_width()
+
+        self._dropdown_win = tk.Toplevel(self.winfo_toplevel())
+        self._dropdown_win.wm_overrideredirect(True)
+        self._dropdown_win.wm_attributes("-topmost", True)
+
+        scroll = tk.Scrollbar(self._dropdown_win)
+        self._dropdown_list = tk.Listbox(
+            self._dropdown_win,
+            yscrollcommand=scroll.set,
+            font=("Arial", 10),
+            selectbackground="#1a1a2e",
+            selectforeground="white",
+            activestyle="dotbox",
+            width=w // 7,
+            height=min(len(items), 8),
+        )
+        scroll.config(command=self._dropdown_list.yview)
+        self._dropdown_list.pack(side="left", fill="both", expand=True)
+        scroll.pack(side="right", fill="y")
+        self._dropdown_list.bind("<ButtonRelease-1>", self._select_from_dropdown)
+        self._dropdown_list.bind("<Return>",          self._select_from_dropdown)
+        self._dropdown_list.bind("<Escape>",          lambda e: (self._hide_dropdown(), self.cadet_entry.focus_set()))
+        self._dropdown_list.bind("<FocusOut>",        self._on_list_focus_out)
+
+        for item in items:
+            self._dropdown_list.insert(tk.END, item)
+
+        self._dropdown_win.geometry(f"+{x}+{y}")
+        self._dropdown_win.lift()
+
+    def _hide_dropdown(self):
+        if self._dropdown_win and self._dropdown_win.winfo_exists():
+            self._dropdown_win.destroy()
+        self._dropdown_win = None
+        self._dropdown_list = None
+
+    def _on_entry_focus_out(self, event=None):
+        self.after(150, self._maybe_hide_dropdown)
+
+    def _on_list_focus_out(self, event=None):
+        self.after(150, self._maybe_hide_dropdown)
+
+    def _maybe_hide_dropdown(self):
+        if self._dropdown_list is None:
+            return
+        focused = self.focus_get()
+        if focused not in (self.cadet_entry, self._dropdown_list):
+            self._hide_dropdown()
+
+    def _focus_dropdown_list(self):
+        if self._dropdown_list and self._dropdown_win and self._dropdown_win.winfo_viewable():
+            self._dropdown_list.focus_set()
+            if self._dropdown_list.size() > 0:
+                self._dropdown_list.selection_set(0)
+                self._dropdown_list.activate(0)
+
+    def _select_from_dropdown(self, event=None):
+        if not self._dropdown_list:
+            return
+        sel = self._dropdown_list.curselection()
+        label = self._dropdown_list.get(sel[0]) if sel else self._dropdown_list.get(tk.ACTIVE)
+        if label:
+            cadet_id = self._cadet_id_map.get(label)
+            if cadet_id:
+                self._hide_dropdown()
+                self._selected_cadet_id = cadet_id
+                self.set_cadet(cadet_id)
+                self.after(50, self.cadet_entry.focus_set)
+
+    def _select_first(self):
+        if self._dropdown_win and self._dropdown_win.winfo_viewable() and self._dropdown_list:
+            if self._dropdown_list.size() > 0:
+                self._dropdown_list.selection_set(0)
+                self._select_from_dropdown()
+
     # ---------------- Set Cadet ----------------
     def set_cadet(self, cadet_id):
-        self.cadet_var.set(cadet_id)
+        self._selected_cadet_id = cadet_id
         for cid, name, flight, points in self.cadets:
             if cid == cadet_id:
+                self.cadet_search_var.set(f"{name} ({flight})")
                 self.selected_cadet_label.config(
                     text=f"✦  {name}  |  {flight}  |  {points} pts"
                 )
@@ -494,7 +593,7 @@ class StaffFrame(tk.Frame):
 
     # ---------------- Move Cadet ----------------
     def move_cadet(self):
-        cadet_id = self.cadet_var.get()
+        cadet_id = self._selected_cadet_id
         new_flight = self.move_flight_var.get()
 
         if not cadet_id:
@@ -510,7 +609,7 @@ class StaffFrame(tk.Frame):
 
     # ---------------- Delete Cadet ----------------
     def delete_cadet(self):
-        cadet_id = self.cadet_var.get()
+        cadet_id = self._selected_cadet_id
 
         if not cadet_id:
             messagebox.showerror("Error", "No cadet selected")
